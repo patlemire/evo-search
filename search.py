@@ -22,6 +22,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
 ]
 
 # --- Helper Functions ---
@@ -30,9 +34,15 @@ def get_random_header_dict():
     return {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
         "DNT": "1",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "cross-site",
+        "Sec-Fetch-User": "?1",
+        "Connection": "keep-alive",
     }
 
 def clean_text(text):
@@ -132,13 +142,18 @@ def is_date_relevant(date_obj, time_filter):
 
 # --- Deep Dive Content Extraction ---
 
-def process_deep_dive(url):
+def process_deep_dive(url, session=None):
     """
     Fetches URL, extracts main content (Readability), converts to Markdown.
     Returns dict with content, author, date, etc.
     """
     try:
-        response = requests.get(url, headers=get_random_header_dict(), timeout=10)
+        # Use provided session or create a new one
+        if session:
+            response = session.get(url, headers=get_random_header_dict(), timeout=15)
+        else:
+            response = requests.get(url, headers=get_random_header_dict(), timeout=15)
+            
         response.raise_for_status()
         
         # Fix encoding
@@ -182,8 +197,13 @@ class SearchProvider:
         raise NotImplementedError
 
 class DDGLiteProvider(SearchProvider):
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update(get_random_header_dict())
+
     def search(self, query, count=5, time_filter=None):
         url = "https://lite.duckduckgo.com/lite/"
+        # DDG Lite: 'q' is query, 'kl' is region
         payload = {'q': query, 'kl': 'us-en'}
         
         # DDG Lite supports 'df' param: d (day), w (week), m (month), y (year)
@@ -191,42 +211,54 @@ class DDGLiteProvider(SearchProvider):
             payload['df'] = time_filter
 
         try:
-            resp = requests.post(url, data=payload, headers=get_random_header_dict(), timeout=10)
+            # Jitter before request
+            time.sleep(random.uniform(1.0, 3.0))
+            
+            # Using session post
+            resp = self.session.post(url, data=payload, timeout=15)
             resp.raise_for_status()
             
             output = resp.text
+            
+            # DEBUG: Save output for inspection if empty
+            # with open("debug_ddg_response.html", "w") as f: f.write(output)
+
             if "anomaly-modal" in output or "challenge-form" in output:
                 raise Exception("DDG Rate Limit / Bot Detection")
 
             results = []
-            rows = output.split('<tr>')
-            current_result = {}
             
-            for row in rows:
+            # Use BeautifulSoup instead of regex for robustness
+            soup = BeautifulSoup(output, 'lxml')
+            
+            # DDG Lite structure: table with rows
+            # Each result is typically 3-4 rows:
+            # 1. Link title (class='result-link')
+            # 2. Snippet (class='result-snippet')
+            # 3. URL/metadata
+            
+            links = soup.find_all('a', class_='result-link')
+            snippets = soup.find_all('td', class_='result-snippet')
+            
+            # They should align by index
+            for i, link in enumerate(links):
                 if len(results) >= count: break
                 
-                # Link extractor
-                link_match = re.search(r'<a[^>]*class="result-link"[^>]*href="(.*?)"[^>]*>(.*?)</a>', row, re.DOTALL)
-                if link_match:
-                    if "title" in current_result:
-                        results.append(current_result)
-                    
-                    raw_link = link_match.group(1)
-                    title = html.unescape(re.sub(r'<[^>]+>', '', link_match.group(2)).strip())
-                    current_result = {"title": title, "url": raw_link, "snippet": "", "source": "ddg_lite"}
-                    continue
-                    
-                # Snippet extractor
-                if "title" in current_result:
-                    snippet_match = re.search(r'class="result-snippet"[^>]*>(.*?)</td>', row, re.DOTALL)
-                    if snippet_match:
-                        current_result["snippet"] = html.unescape(re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip())
-                        results.append(current_result)
-                        current_result = {}
-
-            if "title" in current_result and len(results) < count:
-                results.append(current_result)
+                title = link.get_text().strip()
+                href = link.get('href')
                 
+                snippet = ""
+                if i < len(snippets):
+                    snippet = snippets[i].get_text().strip()
+                
+                if title and href:
+                    results.append({
+                        "title": title,
+                        "url": href,
+                        "snippet": snippet,
+                        "source": "ddg_lite"
+                    })
+
             return results
         except Exception as e:
             # sys.stderr.write(f"DDG Lite Error: {e}\n")
@@ -236,6 +268,7 @@ class GoogleCustomSearchProvider(SearchProvider):
     def __init__(self, api_key, cx):
         self.api_key = api_key
         self.cx = cx
+        self.session = requests.Session()
 
     def search(self, query, count=5, time_filter=None):
         if not self.api_key or not self.cx:
@@ -256,7 +289,7 @@ class GoogleCustomSearchProvider(SearchProvider):
             if time_filter in mapping:
                 params['dateRestrict'] = mapping[time_filter]
 
-        resp = requests.get(url, params=params, timeout=10)
+        resp = self.session.get(url, params=params, timeout=15)
         resp.raise_for_status()
         data = resp.json()
         
@@ -317,35 +350,71 @@ def main():
             results = p.search(query, count=args.count, time_filter=args.time)
             used_provider = p.__class__.__name__
             if results: break
-        except Exception:
+        except Exception as e:
+            # Print to stderr so it doesn't break JSON stdout
+            sys.stderr.write(f"DEBUG: Provider {p.__class__.__name__} failed: {e}\n")
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             continue
             
     if not results:
-        # Fallback: Retry DDG without time filter if it was the issue?
-        # For now, just return empty or error.
-        pass
+        # Fallback: Return empty list but valid JSON
+        print(json.dumps({
+            "query": query,
+            "count": 0,
+            "provider": "none",
+            "results": [],
+            "error": "No results found or all providers failed."
+        }, indent=2, ensure_ascii=False))
+        return
 
     # --- Deep Dive Processing ---
-    if args.deep and results:
-        for res in results:
-            print(f"Deep diving into: {res['url']}", file=sys.stderr)
-            data = process_deep_dive(res['url'])
-            
-            res['deep_content'] = data['full_content']
-            res['extracted_date'] = data.get('extracted_date')
-            
-            # Post-fetch Date Filter Check
-            if args.time and data.get('extracted_date'):
-                try:
-                    dt = date_parser.parse(data['extracted_date'])
-                    if not is_date_relevant(dt, args.time):
-                        res['filtered_out'] = True
-                        res['filter_reason'] = f"Date {dt} outside range {args.time}"
-                except:
-                    pass
+    # Use a shared session for deep dives to reuse connection pool
+    dive_session = requests.Session()
+    
+    final_results = []
+    
+    # Pre-filter: if deep dive is off, we are done with search results
+    # If deep dive is on, we process them.
+    
+    for res in results:
+        # Default status
+        res['deep_dive_status'] = "skipped"
 
-    # Filter out items marked as 'filtered_out'
-    final_results = [r for r in results if not r.get('filtered_out', False)]
+        if args.deep:
+            try:
+                # Jitter before deep dive fetch
+                time.sleep(random.uniform(1.5, 3.5))
+                
+                print(f"Deep diving into: {res['url']}", file=sys.stderr)
+                data = process_deep_dive(res['url'], session=dive_session)
+                
+                if data['status'] == 'success':
+                    res['deep_content'] = data['full_content']
+                    res['extracted_date'] = data.get('extracted_date')
+                    res['deep_dive_status'] = "success"
+                    
+                    # Post-fetch Date Filter Check
+                    if args.time and data.get('extracted_date'):
+                        try:
+                            dt = date_parser.parse(data['extracted_date'])
+                            if not is_date_relevant(dt, args.time):
+                                res['filtered_out'] = True
+                                res['filter_reason'] = f"Date {dt} outside range {args.time}"
+                        except:
+                            pass
+                else:
+                    res['deep_dive_status'] = "failed"
+                    res['error'] = data.get('error')
+                    # Soft fallback: keep the result but without deep content
+                    
+            except Exception as e:
+                res['deep_dive_status'] = "error"
+                res['error'] = str(e)
+        
+        # Only add if not filtered out
+        if not res.get('filtered_out', False):
+            final_results.append(res)
     
     # Output
     output = {
