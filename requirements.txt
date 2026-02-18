@@ -1,2 +1,7 @@
 playwright
 pytest
+beautifulsoup4
+requests
+python-dateutil
+readability-lxml
+html2text
