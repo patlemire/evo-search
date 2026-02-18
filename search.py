@@ -10,6 +10,7 @@ import sys
 import os
 import random
 import time
+import hashlib
 import requests
 from datetime import datetime, timedelta
 from dateutil import parser as date_parser
@@ -27,6 +28,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0"
 ]
+
+CACHE_DIR = ".cache"
+CACHE_FILE = os.path.join(CACHE_DIR, "results_hash.json")
+CACHE_TTL_HOURS = 24
 
 # --- Helper Functions ---
 
@@ -48,6 +53,64 @@ def get_random_header_dict():
 def clean_text(text):
     if not text: return ""
     return re.sub(r'\s+', ' ', text).strip()
+
+# --- Cache System ---
+
+def get_cache_key(query, args):
+    """Generates a unique hash for the query and relevant arguments."""
+    # We include query, deep mode, time filter, count in the hash
+    key_data = {
+        "query": query,
+        "deep": args.deep,
+        "time": args.time,
+        "count": args.count,
+        "media": getattr(args, 'media', False)
+    }
+    key_str = json.dumps(key_data, sort_keys=True)
+    return hashlib.md5(key_str.encode('utf-8')).hexdigest()
+
+def load_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_cache(cache_data):
+    if not os.path.exists(CACHE_DIR):
+        os.makedirs(CACHE_DIR)
+    with open(CACHE_FILE, 'w') as f:
+        json.dump(cache_data, f, indent=2)
+
+def get_cached_result(cache_key):
+    cache = load_cache()
+    if cache_key in cache:
+        entry = cache[cache_key]
+        cached_time = datetime.fromisoformat(entry['timestamp'])
+        if datetime.now() - cached_time < timedelta(hours=CACHE_TTL_HOURS):
+            return entry['data']
+    return None
+
+def store_cached_result(cache_key, data):
+    cache = load_cache()
+    # Clean up old entries (simple maintenance)
+    now = datetime.now()
+    new_cache = {}
+    for k, v in cache.items():
+        try:
+            t = datetime.fromisoformat(v['timestamp'])
+            if now - t < timedelta(hours=CACHE_TTL_HOURS):
+                new_cache[k] = v
+        except:
+            pass
+            
+    new_cache[cache_key] = {
+        "timestamp": now.isoformat(),
+        "data": data
+    }
+    save_cache(new_cache)
 
 # --- Date Extraction ---
 
@@ -142,7 +205,7 @@ def is_date_relevant(date_obj, time_filter):
 
 # --- Deep Dive Content Extraction ---
 
-def process_deep_dive(url, session=None):
+def process_deep_dive(url, session=None, extract_media=False):
     """
     Fetches URL, extracts main content (Readability), converts to Markdown.
     Returns dict with content, author, date, etc.
@@ -161,9 +224,30 @@ def process_deep_dive(url, session=None):
             response.encoding = 'utf-8'
             
         html_content = response.text
+        soup = BeautifulSoup(html_content, 'lxml')
         
         # Extract Metadata
         pub_date = extract_date_from_html(html_content, url)
+        
+        # Media Extraction
+        image_url = None
+        video_urls = []
+        
+        if extract_media:
+            # 1. Image
+            og_image = soup.find('meta', attrs={'property': 'og:image'})
+            twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
+            if og_image and og_image.get('content'):
+                image_url = og_image['content']
+            elif twitter_image and twitter_image.get('content'):
+                image_url = twitter_image['content']
+                
+            # 2. Videos (iframes)
+            # Basic check for youtube/vimeo in src
+            for iframe in soup.find_all('iframe'):
+                src = iframe.get('src', '')
+                if 'youtube.com' in src or 'youtu.be' in src or 'vimeo.com' in src:
+                    video_urls.append(src)
         
         # Readability extraction
         doc = Document(html_content)
@@ -181,6 +265,8 @@ def process_deep_dive(url, session=None):
             "full_content": markdown,
             "extracted_date": pub_date.isoformat() if pub_date else None,
             "extracted_title": title,
+            "image_url": image_url,
+            "video_urls": video_urls,
             "status": "success"
         }
     except Exception as e:
@@ -307,16 +393,29 @@ class GoogleCustomSearchProvider(SearchProvider):
 # --- Main Logic ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Evo-Search v2.0")
+    parser = argparse.ArgumentParser(description="Evo-Search v3.0")
     parser.add_argument("query", nargs="+", help="Search query")
     parser.add_argument("--deep", action="store_true", help="Fetch and parse page content (Deep Dive)")
     parser.add_argument("--time", "-t", choices=['d', 'w', 'm', 'y'], help="Time filter (day, week, month, year)")
     parser.add_argument("--count", "-c", type=int, default=5, help="Max results")
     parser.add_argument("--provider", choices=['ddg', 'google', 'auto'], default='auto', help="Search provider (default: auto failover)")
+    parser.add_argument("--cache", action="store_true", default=True, help="Enable 24h caching (default: True)")
+    parser.add_argument("--no-cache", action="store_false", dest="cache", help="Disable caching")
+    parser.add_argument("--media", action="store_true", help="Extract media (images/videos) in Deep Dive mode")
     
     args = parser.parse_args()
     query = " ".join(args.query)
     
+    # 1. Check Cache
+    cache_key = get_cache_key(query, args)
+    if args.cache:
+        cached_data = get_cached_result(cache_key)
+        if cached_data:
+            # Add metadata to indicate cached result
+            cached_data["cached"] = True
+            print(json.dumps(cached_data, indent=2, ensure_ascii=False, default=str))
+            return
+
     # Initialize Providers
     ddg = DDGLiteProvider()
     
@@ -353,8 +452,8 @@ def main():
         except Exception as e:
             # Print to stderr so it doesn't break JSON stdout
             sys.stderr.write(f"DEBUG: Provider {p.__class__.__name__} failed: {e}\n")
-            import traceback
-            traceback.print_exc(file=sys.stderr)
+            # import traceback
+            # traceback.print_exc(file=sys.stderr)
             continue
             
     if not results:
@@ -378,6 +477,10 @@ def main():
     # If deep dive is on, we process them.
     
     for res in results:
+        # Normalize fields for Source Citation (Goal 3)
+        res['source_url'] = res.get('url')
+        res['source_title'] = res.get('title')
+        
         # Default status
         res['deep_dive_status'] = "skipped"
 
@@ -387,12 +490,16 @@ def main():
                 time.sleep(random.uniform(1.5, 3.5))
                 
                 print(f"Deep diving into: {res['url']}", file=sys.stderr)
-                data = process_deep_dive(res['url'], session=dive_session)
+                data = process_deep_dive(res['url'], session=dive_session, extract_media=args.media)
                 
                 if data['status'] == 'success':
                     res['deep_content'] = data['full_content']
                     res['extracted_date'] = data.get('extracted_date')
                     res['deep_dive_status'] = "success"
+                    
+                    if args.media:
+                        res['image_url'] = data.get('image_url')
+                        res['video_urls'] = data.get('video_urls')
                     
                     # Post-fetch Date Filter Check
                     if args.time and data.get('extracted_date'):
@@ -423,6 +530,10 @@ def main():
         "provider": used_provider,
         "results": final_results
     }
+    
+    # 2. Save to Cache
+    if args.cache and final_results:
+        store_cached_result(cache_key, output)
     
     print(json.dumps(output, indent=2, ensure_ascii=False, default=str))
 
